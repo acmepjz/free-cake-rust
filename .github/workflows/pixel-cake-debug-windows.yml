@@ -1,0 +1,112 @@
+name: Pixel Cake - Windows debug portable
+run-name: Windows debug portable (${{ github.ref_name }})
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: '2'
+  CARGO_PROFILE_DEV_STRIP: none
+  CXXFLAGS: -DLIBRAW_NODLL
+  CFLAGS: -DLIBRAW_NODLL
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      # Checkout uses the branch selected in the Run workflow menu.
+      # It does not fetch or patch the upstream release.
+      - name: Check out selected branch of this fork
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Set up Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build debug application (including frontend)
+        working-directory: apps/desktop
+        run: npm run tauri -- build --debug --no-bundle
+
+      - name: Assemble portable executable, symbols, and DLLs
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:GITHUB_WORKSPACE 'target/debug'
+          $dst = Join-Path $env:GITHUB_WORKSPACE 'portable'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          $exe = Join-Path $src 'pixel-cake.exe'
+          if (-not (Test-Path $exe)) { throw "Missing $exe" }
+          Copy-Item $exe $dst
+
+          # Rust/MSVC typically puts the executable's PDB beside the EXE.
+          $pdb = Join-Path $src 'pixel-cake.pdb'
+          if (Test-Path $pdb) {
+            Copy-Item $pdb $dst
+          } else {
+            # Fallback for toolchains that leave the PDB under deps/.
+            $candidates = @(Get-ChildItem (Join-Path $src 'deps') `
+              -Filter 'pixel_cake*.pdb' -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending)
+            if ($candidates.Count -eq 0) {
+              throw 'No pixel-cake PDB was generated; refusing an incomplete debug artifact.'
+            }
+            Copy-Item $candidates[0].FullName $dst
+          }
+
+          # The ort crate's default copy-dylibs feature normally deposits
+          # ONNX Runtime and execution-provider DLLs beside the executable.
+          Get-ChildItem $src -Filter '*.dll' -File |
+            ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $dst }
+
+          # Look inside the build tree if ort did not copy the core DLL.
+          if (-not (Test-Path (Join-Path $dst 'onnxruntime.dll'))) {
+            $found = Get-ChildItem $src -Recurse -File `
+              -Filter 'onnxruntime.dll' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $found) {
+              throw 'onnxruntime.dll is missing; portable package would not work.'
+            }
+            Get-ChildItem $found.DirectoryName -Filter '*.dll' -File |
+              ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $dst -Force }
+          }
+
+          @(
+            'Pixel Cake, Windows x64 debug build (this fork, no CI source patching).'
+            "Repository: $env:GITHUB_REPOSITORY"
+            "Branch: $env:GITHUB_REF_NAME"
+            "Commit: $(git rev-parse HEAD)"
+            'Place the EXE and DLLs together; install WebView2 and MSVC runtime.'
+            'The PDB belongs to this debug executable, NOT the upstream release EXE.'
+          ) | Set-Content (Join-Path $dst 'README-debug.txt') -Encoding utf8
+
+          Get-ChildItem $dst | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload downloadable ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixel-cake-debug-windows-x64
+          path: portable/*
+          if-no-files-found: error
+          retention-days: 14
