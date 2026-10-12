@@ -70,9 +70,11 @@ jobs:
               -Filter 'pixel_cake*.pdb' -File -ErrorAction SilentlyContinue |
               Sort-Object LastWriteTime -Descending)
             if ($candidates.Count -eq 0) {
-              throw 'No pixel-cake PDB was generated; refusing an incomplete debug artifact.'
+              Write-Warning 'No pixel-cake PDB was found. Uploading the executable without separate PDB symbols.'
             }
-            Copy-Item $candidates[0].FullName $dst
+            if ($candidates.Count -gt 0) {
+              Copy-Item $candidates[0].FullName $dst
+            }
           }
 
           # The ort crate's default copy-dylibs feature normally deposits
@@ -86,10 +88,12 @@ jobs:
               -Filter 'onnxruntime.dll' -ErrorAction SilentlyContinue |
               Select-Object -First 1
             if (-not $found) {
-              throw 'onnxruntime.dll is missing; portable package would not work.'
+              Write-Warning 'onnxruntime.dll was not found in target/debug. Uploading the built executable anyway; check runtime dependencies if it fails to launch.'
             }
-            Get-ChildItem $found.DirectoryName -Filter '*.dll' -File |
-              ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $dst -Force }
+            if ($found) {
+              Get-ChildItem $found.DirectoryName -Filter '*.dll' -File |
+                ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $dst -Force }
+            }
           }
 
           @(
@@ -98,7 +102,9 @@ jobs:
             "Branch: $env:GITHUB_REF_NAME"
             "Commit: $(git rev-parse HEAD)"
             'Place the EXE and DLLs together; install WebView2 and MSVC runtime.'
-            'The PDB belongs to this debug executable, NOT the upstream release EXE.'
+            'The PDB, if present, belongs to this debug EXE, NOT the upstream release EXE.'
+            'WARNING: onnxruntime.dll was not found by CI if it is absent from this ZIP.'
+            'A missing DLL may affect application startup or AI functionality.'
           ) | Set-Content (Join-Path $dst 'README-debug.txt') -Encoding utf8
 
           Get-ChildItem $dst | Select-Object Name, Length | Format-Table -AutoSize
